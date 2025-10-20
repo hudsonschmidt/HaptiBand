@@ -9,5 +9,5 @@ Supported by: Cal Poly College of Engineering, EMPOWER, Pacific West Music of th
 - Clara Swanson
 - Hudson Schmidt
 - Chandni Sharma
-- Pheobe Eplett
+- Phoebe Eplett
 - Amanda Le
