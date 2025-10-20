@@ -2,13 +2,12 @@
 
 This repository provides the source code for **HaptiBand**: a prototype framework for haptic headband feedback following a system of ESP32 microcontrollers utilizing the ESP-NOW protocol. 
 
-Supported by: Cal Poly College of Engineering, Empower Club, 
+Supported by: Cal Poly College of Engineering, EMPOWER, Pacific West Music of the Blind
 
 ## Group Members:
 - Emma Merriman
 - Clara Swanson
 - Hudson Schmidt
-- Chandni 
-- Pheobe 
-- Amanda
-- Cody
+- Chandni Sharma
+- Pheobe Eplett
+- Amanda Le
