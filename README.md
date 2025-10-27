@@ -11,3 +11,4 @@ Supported by: Cal Poly College of Engineering, EMPOWER, Pacific West Music of th
 - Chandni Sharma
 - Phoebe Eplett
 - Amanda Le
+- Cody Wody
