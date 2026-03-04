@@ -5,6 +5,10 @@ import tty
 import time
 import threading
 import select
+import math
+
+# Thread-safe shutdown event
+shutdown_event = threading.Event()
 
 def get_char() -> str:
     fd = sys.stdin.fileno()
@@ -16,16 +20,16 @@ def get_char() -> str:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     return ch
 
-def send_message(msg: str, sock: socket.socket, timeout=2.0) -> None:
+def send(msg: str, sock: socket.socket, timeout=2.0) -> None:
     full = f"{msg}\n".encode()
     sock.sendall(full)
-    print(f"→ {msg}")
+    print(f"\r→ {msg}")
 
     sock.settimeout(timeout)
     try:
         reply = sock.recv(256).decode().strip()
         if reply:
-            print(f"← {reply}")
+            print(f"\r← {reply}")
     except socket.timeout:
         print("Timeout")
 
@@ -34,7 +38,7 @@ def connect(ip: str, port: int, retries=3) -> socket.socket:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.connect((ip, port))
-            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # low‑latency
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             print(f"✓ Connected to {ip}:{port}")
             return s
         except OSError as e:
@@ -42,159 +46,101 @@ def connect(ip: str, port: int, retries=3) -> socket.socket:
             time.sleep(1)
     raise RuntimeError("Unable to reach hub")
 
-def listen_for_data(sock):
-    global running
+def listen(sock):
     sock.setblocking(0)
-    
-    while running:
+
+    while not shutdown_event.is_set():
         ready = select.select([sock], [], [], 0.1)
         if ready[0]:
             try:
                 data = sock.recv(256).decode().strip()
+                spacing_feet = 3.0 
+                
                 if data:
                     print(f"\nReceived from hub: {data}")
+                    print(f"Spacing: {spacing_feet} feet")
+                    
                     # Parse GPS and IMU data
                     if "GPS:" in data and "|IMU:" in data:
                         # Extract GPS data
                         gps_start = data.find("GPS:") + 4
                         gps_end = data.find("|IMU:")
-                        gps_data = data[gps_start:gps_end]
-                        
+                        gps = data[gps_start:gps_end]
+
                         # Extract IMU data
                         imu_start = data.find("|IMU:") + 5
-                        imu_data = data[imu_start:]
+                        imu = data[imu_start:]
+
+                        print(f'GPS: {gps}')
+                        print(f'IMU: {imu}')
+                        coords = split_coordinates(gps, imu, spacing_feet)
+                        print(coords)
+
+                        i = 1
+                        for (lat, lon), theta in coords:
+                            gps_str = f"{lat},{lon}"
+                            imu_str = f"{theta}"
+
+                            formatted_msg = f"1;{i}:{gps_str}|{imu_str}"
+                            print(f"\rSending to headband: {formatted_msg}")
+                            send(formatted_msg, sock)
+                            i += 1
                         
-                        # Format data for headband (row;column:gps|imu)
-                        formatted_msg = f"1;2:{gps_data}|{imu_data}"
-                        print(f"Sending to headband: {formatted_msg}")
-                        send_message(formatted_msg, sock)
             except socket.error:
                 pass
         time.sleep(0.1)
 
-# ── main ───────────────────────────────────────────────────────────
+# Conversion constants
+FEET_PER_DEGREE_LAT = 364567.2  # approximately constant
+
+def feet_to_degrees(feet, latitude):
+    lat_degrees = feet / FEET_PER_DEGREE_LAT
+    lon_degrees = feet / (FEET_PER_DEGREE_LAT * math.cos(math.radians(latitude)))
+    return lat_degrees, lon_degrees
+
+def split_coordinates(gps: str, imu: str, spacing_feet: float = 3.0):
+    lat_str, lon_str = gps.split(",")
+    lat = float(lat_str)
+    lon = float(lon_str)
+
+    theta_deg = int(imu)
+    theta = math.radians(theta_deg)
+
+    # Offsets in multiples of spacing_feet: columns 1-5 left to right
+    offset_multipliers = [-2.0, -1.0, 0.0, 1.0, 2.0]
+    result = []
+
+    for mult in offset_multipliers:
+        distance_feet = mult * spacing_feet
+        lat_offset, lon_offset = feet_to_degrees(abs(distance_feet), lat)
+
+        if distance_feet >= 0:
+            new_lat = lat - (lat_offset * math.cos(theta))
+            new_lon = lon + (lon_offset * math.sin(theta))
+        else:
+            new_lat = lat + (lat_offset * math.cos(theta))
+            new_lon = lon - (lon_offset * math.sin(theta))
+
+        result.append(((new_lat, new_lon), theta_deg))
+
+    return result
+
+# main ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     sock = connect("192.168.4.1", 80)
-    running = True
-    
+
     # Start listener thread for incoming data from the hub
-    listener_thread = threading.Thread(target=listen_for_data, args=(sock,))
-    listener_thread.daemon = True
+    listener_thread = threading.Thread(target=listen, args=(sock,), daemon=True)
     listener_thread.start()
 
     try:
-        print("Press p to quit, or use WASD keys for manual control")
-        while running:
+        while not shutdown_event.is_set():
             key = get_char()
-                # 5 - Left Temple
-                # 18 - Forehead
-                # 19 - Right Temple
-                # 23 - Back of head
-                
-                # FORWARD
-            if key == "w":
-                send_message("1;18:1", sock)
-                time.sleep(0.1)
-                send_message("1;18:0", sock)
-                time.sleep(0.05)
-                send_message("1;18:1", sock)
-                time.sleep(0.1)
-                send_message("1;18:0", sock)
-            
-            # LEFT
-            elif key == "a":
-                send_message("1;5:1", sock)
-                time.sleep(0.1)
-                send_message("1;5:0", sock)
-                time.sleep(0.05)
-                send_message("1;5:1", sock)
-                time.sleep(0.1)
-                send_message("1;5:0", sock)
-
-            # BACKWARD
-            elif key == "s":
-                send_message("1;23:1", sock)
-                time.sleep(0.1)
-                send_message("1;23:0", sock)
-                time.sleep(0.05)
-                send_message("1;23:1", sock)
-                time.sleep(0.1)
-                send_message("1;23:0", sock)
-
-            # RIGHT
-            elif key == "d":
-                send_message("1;19:1", sock)
-                time.sleep(0.1)
-                send_message("1;19:0", sock)
-                time.sleep(0.05)
-                send_message("1;19:1", sock)
-                time.sleep(0.1)
-                send_message("1;19:0", sock)
-            
-            # STOP
-            elif key == "q":
-                send_message("1;5:1", sock)
-                send_message("1;18:1", sock)
-                send_message("1;19:1", sock)
-                send_message("1;23:1", sock)
-                time.sleep(0.1)
-                send_message("1;5:0", sock)
-                send_message("1;18:0", sock)
-                send_message("1;19:0", sock)
-                send_message("1;23:0", sock)
-                time.sleep(0.05)
-                send_message("1;5:1", sock)
-                send_message("1;18:1", sock)
-                send_message("1;19:1", sock)
-                send_message("1;23:1", sock)
-                time.sleep(0.1)
-                send_message("1;5:0", sock)
-                send_message("1;18:0", sock)
-                send_message("1;19:0", sock)
-                send_message("1;23:0", sock)
-
-            # ROTATE LEFT
-            elif key == "z":
-                send_message("1;18:1", sock)
-                time.sleep(0.1)
-                send_message("1;18:0", sock)
-                time.sleep(0.05)
-                send_message("1;5:1", sock)
-                time.sleep(0.1)
-                send_message("1;5:0", sock)
-
-            # ROTATE RIGHT
-            elif key == "x":
-                send_message("1;18:1", sock)
-                time.sleep(0.1)
-                send_message("1;18:0", sock)
-                time.sleep(0.05)
-                send_message("1;19:1", sock)
-                time.sleep(0.1)
-                send_message("1;19:0", sock)
-
-            # START
-            elif key == "e":
-                send_message("1;5:1", sock)
-                send_message("1;19:1", sock)
-                time.sleep(0.1)
-                send_message("1;5:0", sock)
-                send_message("1;19:0", sock)
-                time.sleep(0.05)
-                send_message("1;5:1", sock)
-                send_message("1;19:1", sock)
-                time.sleep(0.1)
-                send_message("1;5:0", sock)
-                send_message("1;19:0", sock)
-                time.sleep(0.1)
-                send_message("1;18:1", sock)
-                time.sleep(0.1)
-                send_message("1;18:0", sock)
-
-            elif key == "p":
-                running = False
+            if key == "q":
+                shutdown_event.set()
                 break
     finally:
-        running = False
+        shutdown_event.set()
+        listener_thread.join(timeout=1.0)
         sock.close()
         print("socket closed")

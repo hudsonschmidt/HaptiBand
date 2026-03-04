@@ -9,8 +9,11 @@
 // TCP server port
 #define TCP_PORT 80
 
-// GPS and IMU data
-const String GPS_DATA = "35.303176,-120.664059";
+const String ROW_NUM = "0";
+const String COL_NUM = "3";
+
+// GPS and IMU data (HARDCODED TEMPORARILY)
+const String GPS_DATA = "35.303276,-120.664299";
 const String IMU_DATA = "194";
 
 WiFiServer tcpServer(TCP_PORT);
@@ -20,7 +23,7 @@ const unsigned long DATA_SEND_INTERVAL = 5000; // 5 seconds
 // Broadcast MAC address for ESP-NOW (to send to all peers)
 uint8_t broadcastAddress[] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
   Serial.print("ESP-NOW broadcast status: ");
   Serial.println((status == ESP_NOW_SEND_SUCCESS) ? "Success" : "Failure");
 }
