@@ -1,6 +1,40 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <math.h>
+#include <mbedtls/md.h>
+#include <HardwareSerial.h>
+
+// Shared HMAC key for message authentication (must match hub.ino)
+static const uint8_t HMAC_KEY[32] = {
+  0x7A, 0x4E, 0x2B, 0x91, 0xF3, 0x8C, 0x5D, 0xE7,
+  0x1F, 0x6A, 0xC4, 0x83, 0x9B, 0x2E, 0xD5, 0x70,
+  0xA8, 0x3F, 0x6C, 0x19, 0xE2, 0x7D, 0x4B, 0x95,
+  0x0C, 0x68, 0xB1, 0xF9, 0x3A, 0x57, 0xDE, 0x84
+};
+
+// Replay protection: track last seen sequence number
+// Allow a window to handle out-of-order packets
+static uint32_t lastSeqNum = 0;
+static const uint32_t SEQ_WINDOW = 100;  // Accept packets within this window ahead
+
+// RTCM handling
+#define RTCM_ESPNOW_PREFIX 0xD3  // Standard RTCM3 preamble byte
+
+// RTK GPS serial connection (UART2)
+// Connect RTK module: RX->GPIO16, TX->GPIO17
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
+#define GPS_BAUD 460800  // LC29H-DA default baud rate
+HardwareSerial GPSSerial(2);
+
+// RTCM reassembly buffer for chunked messages
+#define RTCM_BUFFER_SIZE 1024
+static uint8_t rtcmBuffer[RTCM_BUFFER_SIZE];
+static size_t rtcmBufferLen = 0;
+static uint8_t expectedChunk = 0;
+static uint8_t totalChunks = 0;
+static unsigned long lastRtcmTime = 0;
+#define RTCM_TIMEOUT_MS 1000  // Reset if chunks arrive too slowly
 
 const int MOTOR_PIN_5 = 5;
 const int MOTOR_PIN_18 = 18;
@@ -10,10 +44,22 @@ const int MOTOR_PIN_23 = 23;
 const String ROW_NUM = "1";
 const String COL_NUM = "3";
 
-// HARDCODED TEMPORARILY
-const float cur_LAT = 35.303276;
-const float cur_LON = -120.664299;
-const int cur_IMU = 194;
+// Live GPS state (updated from RTK module NMEA output)
+static float cur_LAT = 0.0;
+static float cur_LON = 0.0;
+static int   cur_IMU = 0;          // heading not available from GPS alone
+static uint8_t gps_fix_quality = 0; // 0=none, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float
+static bool  gps_valid = false;     // true once we have a valid fix
+static unsigned long lastGpsTime = 0;
+
+// NMEA sentence buffer
+#define NMEA_BUF_SIZE 128
+static char nmeaBuf[NMEA_BUF_SIZE];
+static uint8_t nmeaIdx = 0;
+
+// GPS status print interval
+static unsigned long lastGpsPrint = 0;
+#define GPS_PRINT_INTERVAL 5000  // print status every 5 seconds
 
 // Tolerance for GPS comparison (~0.3 feet at this latitude)
 const float GPS_TOLERANCE = 0.000001;
@@ -22,6 +68,140 @@ const float GPS_TOLERANCE = 0.000001;
 const int IMU_DEADZONE = 5;       // no correction needed
 const int IMU_SOFT_LIMIT = 15;    // gentle correction
 // beyond SOFT_LIMIT = urgent correction
+
+// ─────────────── NMEA parsing ───────────────────────────────
+// Get the Nth comma-delimited field from an NMEA sentence (0-indexed)
+String nmeaField(const char* sentence, int fieldNum) {
+  int current = 0;
+  const char* start = sentence;
+
+  for (const char* p = sentence; *p; p++) {
+    if (*p == ',' || *p == '*') {
+      if (current == fieldNum) {
+        return String(sentence).substring(start - sentence, p - sentence);
+      }
+      current++;
+      start = p + 1;
+    }
+  }
+  // Last field (no trailing comma)
+  if (current == fieldNum) {
+    return String(start);
+  }
+  return "";
+}
+
+// Convert NMEA lat/lon (DDMM.MMMMM) to decimal degrees
+float nmeaToDecimal(const String& raw, const String& dir) {
+  if (raw.length() == 0) return 0.0;
+
+  // Find the decimal point to split degrees from minutes
+  int dotPos = raw.indexOf('.');
+  if (dotPos < 0) return 0.0;
+
+  // Degrees are everything before the last 2 digits before the dot
+  int degLen = dotPos - 2;
+  if (degLen < 1) return 0.0;
+
+  float degrees = raw.substring(0, degLen).toFloat();
+  float minutes = raw.substring(degLen).toFloat();
+  float decimal = degrees + (minutes / 60.0);
+
+  if (dir == "S" || dir == "W") {
+    decimal = -decimal;
+  }
+  return decimal;
+}
+
+// Parse a complete NMEA sentence
+void parseNMEA(const char* sentence) {
+  // We care about GGA (position + fix quality) and RMC (position + course)
+  // Accept any talker ID (GP, GN, GL, etc.)
+  const char* type = sentence + 3;  // skip $XX
+
+  if (strncmp(type, "GGA,", 4) == 0) {
+    // $xxGGA,time,lat,N/S,lon,E/W,quality,numSV,HDOP,alt,M,sep,M,age,stn*cs
+    //         0    1   2   3   4     5      6     7    8  9 10 11  12  13
+    String lat_raw = nmeaField(sentence, 2);
+    String lat_dir = nmeaField(sentence, 3);
+    String lon_raw = nmeaField(sentence, 4);
+    String lon_dir = nmeaField(sentence, 5);
+    String quality = nmeaField(sentence, 6);
+
+    uint8_t q = quality.toInt();
+    gps_fix_quality = q;
+
+    if (q > 0 && lat_raw.length() > 0 && lon_raw.length() > 0) {
+      cur_LAT = nmeaToDecimal(lat_raw, lat_dir);
+      cur_LON = nmeaToDecimal(lon_raw, lon_dir);
+      gps_valid = true;
+      lastGpsTime = millis();
+      Serial.printf("GGA: %.6f, %.6f | Fix: %s (%d)\n",
+                    cur_LAT, cur_LON, fixQualityStr(q), q);
+    }
+
+  } else if (strncmp(type, "RMC,", 4) == 0) {
+    // $xxRMC,time,status,lat,N/S,lon,E/W,speed,course,date,...
+    //         0     1     2   3   4   5    6      7      8
+    String status = nmeaField(sentence, 2);
+
+    if (status == "A") {  // A = valid
+      String lat_raw = nmeaField(sentence, 3);
+      String lat_dir = nmeaField(sentence, 4);
+      String lon_raw = nmeaField(sentence, 5);
+      String lon_dir = nmeaField(sentence, 6);
+      String course  = nmeaField(sentence, 8);
+
+      if (lat_raw.length() > 0 && lon_raw.length() > 0) {
+        cur_LAT = nmeaToDecimal(lat_raw, lat_dir);
+        cur_LON = nmeaToDecimal(lon_raw, lon_dir);
+        gps_valid = true;
+        lastGpsTime = millis();
+      }
+
+      // Course over ground (heading) — only valid when moving
+      if (course.length() > 0) {
+        cur_IMU = (int)course.toFloat();
+      }
+
+      Serial.printf("RMC: %.6f, %.6f | Heading: %d°\n",
+                    cur_LAT, cur_LON, cur_IMU);
+    }
+  }
+}
+
+// Read and process available bytes from GPS serial
+void readGPS() {
+  while (GPSSerial.available()) {
+    char c = GPSSerial.read();
+
+    if (c == '$') {
+      // Start of new sentence
+      nmeaIdx = 0;
+      nmeaBuf[nmeaIdx++] = c;
+    } else if (c == '\n' || c == '\r') {
+      // End of sentence
+      if (nmeaIdx > 5) {
+        nmeaBuf[nmeaIdx] = '\0';
+        parseNMEA(nmeaBuf);
+      }
+      nmeaIdx = 0;
+    } else if (nmeaIdx < NMEA_BUF_SIZE - 1) {
+      nmeaBuf[nmeaIdx++] = c;
+    }
+  }
+}
+
+const char* fixQualityStr(uint8_t q) {
+  switch (q) {
+    case 0: return "No fix";
+    case 1: return "GPS";
+    case 2: return "DGPS";
+    case 4: return "RTK Fixed";
+    case 5: return "RTK Float";
+    default: return "Unknown";
+  }
+}
 
 // helper ------------------------------------------------------
 void buzz(int pin, bool on) {
@@ -82,17 +262,163 @@ int normalizeHeading(int diff) {
   return diff;
 }
 
+// Handle incoming RTCM chunk and reassemble
+// Returns true if a complete message was assembled and sent to GPS
+bool handleRTCMChunk(const uint8_t* data, int len) {
+  if (len < 3) return false;
+
+  // Parse header: [0xD3][chunkNum|totalChunks][data...]
+  uint8_t chunkInfo = data[1];
+  uint8_t chunkNum = (chunkInfo >> 4) & 0x0F;
+  uint8_t chunks = chunkInfo & 0x0F;
+  const uint8_t* payload = data + 2;
+  size_t payloadLen = len - 2;
+
+  unsigned long now = millis();
+
+  // Reset buffer if timeout or new message sequence
+  if (chunkNum == 0 || (now - lastRtcmTime > RTCM_TIMEOUT_MS)) {
+    rtcmBufferLen = 0;
+    expectedChunk = 0;
+    totalChunks = chunks;
+  }
+
+  lastRtcmTime = now;
+
+  // Check chunk sequence
+  if (chunkNum != expectedChunk) {
+    Serial.printf("RTCM: expected chunk %d, got %d - resetting\n", expectedChunk, chunkNum);
+    rtcmBufferLen = 0;
+    expectedChunk = 0;
+    return false;
+  }
+
+  // Append to buffer
+  if (rtcmBufferLen + payloadLen > RTCM_BUFFER_SIZE) {
+    Serial.println("RTCM: buffer overflow");
+    rtcmBufferLen = 0;
+    expectedChunk = 0;
+    return false;
+  }
+
+  memcpy(rtcmBuffer + rtcmBufferLen, payload, payloadLen);
+  rtcmBufferLen += payloadLen;
+  expectedChunk++;
+
+  // Check if complete
+  if (expectedChunk >= totalChunks) {
+    // Send complete RTCM message to GPS module
+    GPSSerial.write(rtcmBuffer, rtcmBufferLen);
+    Serial.printf("RTCM: sent %zu bytes to GPS\n", rtcmBufferLen);
+
+    rtcmBufferLen = 0;
+    expectedChunk = 0;
+    totalChunks = 0;
+    return true;
+  }
+
+  return false;
+}
+
+// Generate HMAC-SHA256 and return first 8 bytes as hex string
+String generateHMAC(uint32_t seq, const String& payload) {
+  String message = String(seq) + ":" + payload;
+
+  uint8_t hmacResult[32];
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+  mbedtls_md_hmac_starts(&ctx, HMAC_KEY, sizeof(HMAC_KEY));
+  mbedtls_md_hmac_update(&ctx, (const unsigned char*)message.c_str(), message.length());
+  mbedtls_md_hmac_finish(&ctx, hmacResult);
+  mbedtls_md_free(&ctx);
+
+  char hexStr[17];
+  for (int i = 0; i < 8; i++) {
+    sprintf(&hexStr[i * 2], "%02x", hmacResult[i]);
+  }
+  hexStr[16] = '\0';
+  return String(hexStr);
+}
+
+// Verify authenticated message format: "seq:payload:hmac"
+// Returns payload if valid, empty string if invalid
+String verifyAndExtract(const String& authMsg) {
+  // Find first colon (after seq)
+  int firstColon = authMsg.indexOf(':');
+  if (firstColon < 0) {
+    Serial.println(F("Auth failed: no sequence number"));
+    return "";
+  }
+
+  // Find last colon (before hmac)
+  int lastColon = authMsg.lastIndexOf(':');
+  if (lastColon <= firstColon || lastColon == authMsg.length() - 1) {
+    Serial.println(F("Auth failed: no HMAC"));
+    return "";
+  }
+
+  // Extract components
+  String seqStr = authMsg.substring(0, firstColon);
+  String payload = authMsg.substring(firstColon + 1, lastColon);
+  String receivedHmac = authMsg.substring(lastColon + 1);
+  receivedHmac.toLowerCase();
+
+  uint32_t seq = strtoul(seqStr.c_str(), NULL, 10);
+
+  // Check for replay attack
+  if (seq <= lastSeqNum && lastSeqNum - seq < SEQ_WINDOW) {
+    Serial.printf("Replay rejected: seq %lu <= last %lu\n", seq, lastSeqNum);
+    return "";
+  }
+
+  // Reject sequences too far in the future (possible attack)
+  if (seq > lastSeqNum + SEQ_WINDOW * 10) {
+    Serial.printf("Suspicious seq: %lu (last: %lu)\n", seq, lastSeqNum);
+    return "";
+  }
+
+  // Verify HMAC
+  String expectedHmac = generateHMAC(seq, payload);
+  if (!receivedHmac.equals(expectedHmac)) {
+    Serial.println(F("Auth failed: HMAC mismatch"));
+    Serial.println("Expected: " + expectedHmac);
+    Serial.println("Received: " + receivedHmac);
+    return "";
+  }
+
+  // Update sequence tracking
+  if (seq > lastSeqNum) {
+    lastSeqNum = seq;
+  }
+
+  Serial.printf("Auth OK: seq=%lu\n", seq);
+  return payload;
+}
+
 // callback -----------------------------------------------
 void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len)
 {
   if (len <= 0) return;                 // safety
 
+  /* ----- Check for RTCM correction data (starts with 0xD3) ------- */
+  if (data[0] == RTCM_ESPNOW_PREFIX) {
+    handleRTCMChunk(data, len);
+    return;  // RTCM handled separately, no auth needed
+  }
+
   /* ----- make a clean, NUL-terminated copy of the payload -------- */
   char buf[len + 1];
   memcpy(buf, data, len);
   buf[len] = '\0';                      // hard terminate
-  String msg(buf);
-  msg.trim();                           // drop CR/LF if present
+  String authMsg(buf);
+  authMsg.trim();                       // drop CR/LF if present
+
+  /* ----- verify authentication and extract payload --------------- */
+  String msg = verifyAndExtract(authMsg);
+  if (msg.length() == 0) {
+    return;  // Authentication failed - ignore message
+  }
 
   /* ----- determine packet type ----------------------------------- */
   bool hasBar = msg.indexOf('|') != -1; // GPS|IMU if true
@@ -129,7 +455,13 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len)
     int recv_imu = imu.toInt();
 
     Serial.printf("Target GPS=%.6f,%.6f  IMU=%d\n", recv_lat, recv_lon, recv_imu);
-    Serial.printf("Current GPS=%.6f,%.6f  IMU=%d\n", cur_LAT, cur_LON, cur_IMU);
+    Serial.printf("Current GPS=%.6f,%.6f  IMU=%d | Fix: %s\n",
+                  cur_LAT, cur_LON, cur_IMU, fixQualityStr(gps_fix_quality));
+
+    if (!gps_valid) {
+      Serial.println("WARNING: No GPS fix yet, cannot compare position");
+      return;
+    }
 
     // Compare GPS position
     bool lat_match = fabs(recv_lat - cur_LAT) < GPS_TOLERANCE;
@@ -198,7 +530,11 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len)
 void setup() {
   // Initialize Serial Monitor for debugging
   Serial.begin(115200);
-  Serial.println("ESP32 ESP‑NOW Receiver Starting...");
+  Serial.println("ESP32 ESP-NOW Receiver Starting...");
+
+  // Initialize GPS serial connection for RTCM corrections
+  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  Serial.println("GPS Serial initialized (UART2)");
 
   // Set the motor pins as outputs
   pinMode(MOTOR_PIN_5, OUTPUT);
@@ -206,20 +542,38 @@ void setup() {
   pinMode(MOTOR_PIN_19, OUTPUT);
   pinMode(MOTOR_PIN_23, OUTPUT);
 
-  // Set Wi‑Fi mode to station (STA) mode
+  // Set Wi-Fi mode to station (STA) mode
   WiFi.mode(WIFI_STA);
 
-  // Initialize ESP‑NOW
+  // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
-    Serial.println("Error initializing ESP‑NOW");
+    Serial.println("Error initializing ESP-NOW");
     return;
   }
-  Serial.println("ESP‑NOW initialized.");
+  Serial.println("ESP-NOW initialized.");
 
   // Register the receive callback using the updated function signature
   esp_now_register_recv_cb(OnDataRecv);
 }
 
 void loop() {
+  // Read NMEA sentences from RTK GPS module
+  readGPS();
+
+  // Print GPS status periodically
+  unsigned long now = millis();
+  if (now - lastGpsPrint >= GPS_PRINT_INTERVAL) {
+    lastGpsPrint = now;
+
+    if (gps_valid) {
+      unsigned long age = (now - lastGpsTime) / 1000;
+      Serial.printf("GPS: %.6f, %.6f | Heading: %d° | Fix: %s (%d) | Age: %lus\n",
+                    cur_LAT, cur_LON, cur_IMU, fixQualityStr(gps_fix_quality),
+                    gps_fix_quality, age);
+    } else {
+      Serial.println("GPS: Waiting for fix...");
+    }
+  }
+
   delay(10);
 }
