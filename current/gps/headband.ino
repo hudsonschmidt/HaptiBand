@@ -15,6 +15,7 @@ static const uint8_t HMAC_KEY[32] = {
 // Replay protection: track last seen sequence number
 // Allow a window to handle out-of-order packets
 static uint32_t lastSeqNum = 0;
+static bool seqInitialized = false;      // false until first valid message received
 static const uint32_t SEQ_WINDOW = 100;  // Accept packets within this window ahead
 
 // RTCM handling
@@ -45,15 +46,15 @@ const String ROW_NUM = "1";
 const String COL_NUM = "3";
 
 // Live GPS state (updated from RTK module NMEA output)
-static float cur_LAT = 0.0;
-static float cur_LON = 0.0;
-static int   cur_IMU = 0;          // heading not available from GPS alone
+static double cur_LAT = 0.0;
+static double cur_LON = 0.0;
+static int    cur_IMU = 0;          // heading not available from GPS alone
 static uint8_t gps_fix_quality = 0; // 0=none, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK float
 static bool  gps_valid = false;     // true once we have a valid fix
 static unsigned long lastGpsTime = 0;
 
-// NMEA sentence buffer
-#define NMEA_BUF_SIZE 128
+// NMEA sentence buffer (256 bytes for safety with high-precision NMEA)
+#define NMEA_BUF_SIZE 256
 static char nmeaBuf[NMEA_BUF_SIZE];
 static uint8_t nmeaIdx = 0;
 
@@ -62,7 +63,7 @@ static unsigned long lastGpsPrint = 0;
 #define GPS_PRINT_INTERVAL 5000  // print status every 5 seconds
 
 // Tolerance for GPS comparison (~0.3 feet at this latitude)
-const float GPS_TOLERANCE = 0.000001;
+const double GPS_TOLERANCE = 0.000003;
 
 // IMU tolerance thresholds (degrees)
 const int IMU_DEADZONE = 5;       // no correction needed
@@ -92,20 +93,33 @@ String nmeaField(const char* sentence, int fieldNum) {
 }
 
 // Convert NMEA lat/lon (DDMM.MMMMM) to decimal degrees
-float nmeaToDecimal(const String& raw, const String& dir) {
-  if (raw.length() == 0) return 0.0;
+double nmeaToDecimal(const char* raw, int rawLen, const String& dir) {
+  if (rawLen == 0) return 0.0;
 
   // Find the decimal point to split degrees from minutes
-  int dotPos = raw.indexOf('.');
+  int dotPos = -1;
+  for (int i = 0; i < rawLen; i++) {
+    if (raw[i] == '.') { dotPos = i; break; }
+  }
   if (dotPos < 0) return 0.0;
 
   // Degrees are everything before the last 2 digits before the dot
   int degLen = dotPos - 2;
   if (degLen < 1) return 0.0;
 
-  float degrees = raw.substring(0, degLen).toFloat();
-  float minutes = raw.substring(degLen).toFloat();
-  float decimal = degrees + (minutes / 60.0);
+  // Use strtod for full double precision (toFloat truncates to 32-bit)
+  char tmp[24];
+  int cpLen = (rawLen < 23) ? rawLen : 23;
+  memcpy(tmp, raw, cpLen);
+  tmp[cpLen] = '\0';
+
+  char degBuf[8];
+  memcpy(degBuf, tmp, degLen);
+  degBuf[degLen] = '\0';
+
+  double degrees = strtod(degBuf, NULL);
+  double minutes = strtod(tmp + degLen, NULL);
+  double decimal = degrees + (minutes / 60.0);
 
   if (dir == "S" || dir == "W") {
     decimal = -decimal;
@@ -132,12 +146,11 @@ void parseNMEA(const char* sentence) {
     gps_fix_quality = q;
 
     if (q > 0 && lat_raw.length() > 0 && lon_raw.length() > 0) {
-      cur_LAT = nmeaToDecimal(lat_raw, lat_dir);
-      cur_LON = nmeaToDecimal(lon_raw, lon_dir);
+      cur_LAT = nmeaToDecimal(lat_raw.c_str(), lat_raw.length(), lat_dir);
+      cur_LON = nmeaToDecimal(lon_raw.c_str(), lon_raw.length(), lon_dir);
       gps_valid = true;
       lastGpsTime = millis();
-      Serial.printf("GGA: %.6f, %.6f | Fix: %s (%d)\n",
-                    cur_LAT, cur_LON, fixQualityStr(q), q);
+      Serial.printf("GGA: %.6f, %.6f | Fix: %s (%d)\n", cur_LAT, cur_LON, fixQualityStr(q), q);
     }
 
   } else if (strncmp(type, "RMC,", 4) == 0) {
@@ -153,8 +166,8 @@ void parseNMEA(const char* sentence) {
       String course  = nmeaField(sentence, 8);
 
       if (lat_raw.length() > 0 && lon_raw.length() > 0) {
-        cur_LAT = nmeaToDecimal(lat_raw, lat_dir);
-        cur_LON = nmeaToDecimal(lon_raw, lon_dir);
+        cur_LAT = nmeaToDecimal(lat_raw.c_str(), lat_raw.length(), lat_dir);
+        cur_LON = nmeaToDecimal(lon_raw.c_str(), lon_raw.length(), lon_dir);
         gps_valid = true;
         lastGpsTime = millis();
       }
@@ -366,16 +379,18 @@ String verifyAndExtract(const String& authMsg) {
 
   uint32_t seq = strtoul(seqStr.c_str(), NULL, 10);
 
-  // Check for replay attack
-  if (seq <= lastSeqNum && lastSeqNum - seq < SEQ_WINDOW) {
-    Serial.printf("Replay rejected: seq %lu <= last %lu\n", seq, lastSeqNum);
-    return "";
-  }
+  // Check for replay attack (skip on first message ever received)
+  if (seqInitialized) {
+    if (seq <= lastSeqNum && lastSeqNum - seq < SEQ_WINDOW) {
+      Serial.printf("Replay rejected: seq %lu <= last %lu\n", seq, lastSeqNum);
+      return "";
+    }
 
-  // Reject sequences too far in the future (possible attack)
-  if (seq > lastSeqNum + SEQ_WINDOW * 10) {
-    Serial.printf("Suspicious seq: %lu (last: %lu)\n", seq, lastSeqNum);
-    return "";
+    // Reject sequences too far in the future (possible attack)
+    if (seq > lastSeqNum + SEQ_WINDOW * 10) {
+      Serial.printf("Suspicious seq: %lu (last: %lu)\n", seq, lastSeqNum);
+      return "";
+    }
   }
 
   // Verify HMAC
@@ -388,8 +403,9 @@ String verifyAndExtract(const String& authMsg) {
   }
 
   // Update sequence tracking
-  if (seq > lastSeqNum) {
+  if (!seqInitialized || seq > lastSeqNum) {
     lastSeqNum = seq;
+    seqInitialized = true;
   }
 
   Serial.printf("Auth OK: seq=%lu\n", seq);
@@ -450,8 +466,8 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len)
       Serial.println(F("Ill-formed GPS (missing comma)"));
       return;
     }
-    float recv_lat = gps.substring(0, comma).toFloat();
-    float recv_lon = gps.substring(comma + 1).toFloat();
+    double recv_lat = strtod(gps.substring(0, comma).c_str(), NULL);
+    double recv_lon = strtod(gps.substring(comma + 1).c_str(), NULL);
     int recv_imu = imu.toInt();
 
     Serial.printf("Target GPS=%.6f,%.6f  IMU=%d\n", recv_lat, recv_lon, recv_imu);
@@ -533,8 +549,10 @@ void setup() {
   Serial.println("ESP32 ESP-NOW Receiver Starting...");
 
   // Initialize GPS serial connection for RTCM corrections
+  // MUST set RX buffer before begin() — default 256 bytes overflows at 460800 baud
+  GPSSerial.setRxBufferSize(2048);
   GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.println("GPS Serial initialized (UART2)");
+  Serial.println("GPS Serial initialized (UART2, 2048-byte RX buffer)");
 
   // Set the motor pins as outputs
   pinMode(MOTOR_PIN_5, OUTPUT);
@@ -575,5 +593,5 @@ void loop() {
     }
   }
 
-  delay(10);
+  delay(1);
 }
