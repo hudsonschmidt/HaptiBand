@@ -1,4 +1,5 @@
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <esp_now.h>
 #include <math.h>
 #include <mbedtls/md.h>
@@ -22,11 +23,18 @@ static const uint32_t SEQ_WINDOW = 100;  // Accept packets within this window ah
 #define RTCM_ESPNOW_PREFIX 0xD3  // Standard RTCM3 preamble byte
 
 // RTK GPS serial connection (UART2)
-// Connect RTK module: RX->GPIO16, TX->GPIO17
+// Wiring: GPS module TX → ESP32 GPIO16 (RX), GPS module RX → ESP32 GPIO17 (TX)
 #define GPS_RX_PIN 16
 #define GPS_TX_PIN 17
-#define GPS_BAUD 460800  // LC29H-DA default baud rate
 HardwareSerial GPSSerial(2);
+
+// Baud rates to try during auto-detection (most likely first)
+static const long GPS_BAUDS[] = {460800, 115200, 38400, 9600};
+static const int  GPS_BAUD_COUNT = sizeof(GPS_BAUDS) / sizeof(GPS_BAUDS[0]);
+static long       gpsActiveBaud = 0;  // The baud rate that worked
+
+// WiFi channel — MUST match hub AP_CHANNEL
+#define WIFI_CHANNEL 1
 
 // RTCM reassembly buffer for chunked messages
 #define RTCM_BUFFER_SIZE 1024
@@ -36,6 +44,12 @@ static uint8_t expectedChunk = 0;
 static uint8_t totalChunks = 0;
 static unsigned long lastRtcmTime = 0;
 #define RTCM_TIMEOUT_MS 1000  // Reset if chunks arrive too slowly
+
+// Deferred RTCM write buffer — callback copies here, loop() writes to UART
+// This avoids blocking GPSSerial.write() inside the ESP-NOW callback
+#define RTCM_WRITE_BUF_SIZE 1024
+static uint8_t  rtcmWriteBuf[RTCM_WRITE_BUF_SIZE];
+static volatile size_t rtcmWriteLen = 0;  // >0 means data pending for GPS
 
 const int MOTOR_PIN_5 = 5;
 const int MOTOR_PIN_18 = 18;
@@ -53,22 +67,88 @@ static uint8_t gps_fix_quality = 0; // 0=none, 1=GPS, 2=DGPS, 4=RTK fixed, 5=RTK
 static bool  gps_valid = false;     // true once we have a valid fix
 static unsigned long lastGpsTime = 0;
 
-// NMEA sentence buffer (256 bytes for safety with high-precision NMEA)
+// NMEA sentence buffer
 #define NMEA_BUF_SIZE 256
 static char nmeaBuf[NMEA_BUF_SIZE];
-static uint8_t nmeaIdx = 0;
+static uint16_t nmeaIdx = 0;        // uint16_t to safely index up to NMEA_BUF_SIZE
 
 // GPS status print interval
 static unsigned long lastGpsPrint = 0;
 #define GPS_PRINT_INTERVAL 5000  // print status every 5 seconds
 
-// Tolerance for GPS comparison (~0.3 feet at this latitude)
+// GPS UART diagnostic counters
+static unsigned long gpsRxByteCount = 0;   // total bytes received from GPS UART
+static unsigned long gpsDollarCount = 0;   // '$' characters seen (start of NMEA)
+static unsigned long gpsNmeaParsed = 0;    // complete sentences parsed
+static bool gpsDiagDone = false;           // only dump raw bytes once
+
+// Tolerance for GPS comparison (~1 foot at this latitude)
 const double GPS_TOLERANCE = 0.000003;
 
 // IMU tolerance thresholds (degrees)
 const int IMU_DEADZONE = 5;       // no correction needed
 const int IMU_SOFT_LIMIT = 15;    // gentle correction
 // beyond SOFT_LIMIT = urgent correction
+
+// ─────────────── Baud rate auto-detection ────────────────────
+// Try each baud rate and look for readable ASCII / '$' within a timeout.
+// Returns the working baud rate, or 0 if none found.
+long detectGPSBaud() {
+  for (int i = 0; i < GPS_BAUD_COUNT; i++) {
+    long baud = GPS_BAUDS[i];
+    Serial.printf("Probing GPS at %ld baud...\n", baud);
+
+    GPSSerial.end();
+    GPSSerial.setRxBufferSize(2048);
+    GPSSerial.begin(baud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
+    // Drain any stale data
+    while (GPSSerial.available()) GPSSerial.read();
+
+    // Wait up to 1.5 seconds for recognizable data
+    unsigned long start = millis();
+    int asciiCount = 0;
+    int totalBytes = 0;
+    bool sawDollar = false;
+
+    while (millis() - start < 1500) {
+      if (GPSSerial.available()) {
+        char c = GPSSerial.read();
+        totalBytes++;
+        if (c == '$') sawDollar = true;
+        if (c >= 0x20 && c < 0x7F) asciiCount++;
+      }
+      // Don't burn CPU — but check frequently
+      if (!GPSSerial.available()) delayMicroseconds(100);
+    }
+
+    Serial.printf("  → %d bytes, %d ASCII, dollar=%s\n",
+                  totalBytes, asciiCount, sawDollar ? "YES" : "no");
+
+    // Success: saw a '$' or >50% of bytes are printable ASCII
+    if (sawDollar || (totalBytes > 10 && asciiCount > totalBytes / 2)) {
+      Serial.printf("GPS detected at %ld baud\n", baud);
+      // Re-init cleanly at this baud
+      GPSSerial.end();
+      GPSSerial.setRxBufferSize(2048);
+      GPSSerial.begin(baud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+      return baud;
+    }
+
+    // If we got bytes but they're garbage, wrong baud — try next
+    if (totalBytes > 0) {
+      Serial.printf("  → garbage data, wrong baud\n");
+    }
+  }
+
+  Serial.println("WARNING: No GPS module detected at any baud rate!");
+  Serial.println("Check wiring: GPS TX → ESP32 GPIO16, GPS RX → ESP32 GPIO17");
+  // Fall back to 460800 and keep trying
+  GPSSerial.end();
+  GPSSerial.setRxBufferSize(2048);
+  GPSSerial.begin(460800, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  return 0;
+}
 
 // ─────────────── NMEA parsing ───────────────────────────────
 // Get the Nth comma-delimited field from an NMEA sentence (0-indexed)
@@ -127,11 +207,23 @@ double nmeaToDecimal(const char* raw, int rawLen, const String& dir) {
   return decimal;
 }
 
+const char* fixQualityStr(uint8_t q) {
+  switch (q) {
+    case 0: return "No fix";
+    case 1: return "GPS";
+    case 2: return "DGPS";
+    case 4: return "RTK Fixed";
+    case 5: return "RTK Float";
+    default: return "Unknown";
+  }
+}
+
 // Parse a complete NMEA sentence
 void parseNMEA(const char* sentence) {
   // We care about GGA (position + fix quality) and RMC (position + course)
   // Accept any talker ID (GP, GN, GL, etc.)
-  const char* type = sentence + 3;  // skip $XX
+  if (strlen(sentence) < 7) return;  // safety: need at least $XXYYY,
+  const char* type = sentence + 3;   // skip $XX
 
   if (strncmp(type, "GGA,", 4) == 0) {
     // $xxGGA,time,lat,N/S,lon,E/W,quality,numSV,HDOP,alt,M,sep,M,age,stn*cs
@@ -187,8 +279,21 @@ void parseNMEA(const char* sentence) {
 void readGPS() {
   while (GPSSerial.available()) {
     char c = GPSSerial.read();
+    gpsRxByteCount++;
+
+    // Dump first 64 raw bytes once for diagnostics (detect baud mismatch)
+    if (!gpsDiagDone && gpsRxByteCount <= 64) {
+      Serial.printf("GPS_RAW[%lu]: 0x%02X '%c'\n",
+                    gpsRxByteCount, (uint8_t)c,
+                    (c >= 0x20 && c < 0x7F) ? c : '.');
+      if (gpsRxByteCount == 64) {
+        gpsDiagDone = true;
+        Serial.println("--- end GPS raw dump ---");
+      }
+    }
 
     if (c == '$') {
+      gpsDollarCount++;
       // Start of new sentence
       nmeaIdx = 0;
       nmeaBuf[nmeaIdx++] = c;
@@ -196,23 +301,13 @@ void readGPS() {
       // End of sentence
       if (nmeaIdx > 5) {
         nmeaBuf[nmeaIdx] = '\0';
+        gpsNmeaParsed++;
         parseNMEA(nmeaBuf);
       }
       nmeaIdx = 0;
     } else if (nmeaIdx < NMEA_BUF_SIZE - 1) {
       nmeaBuf[nmeaIdx++] = c;
     }
-  }
-}
-
-const char* fixQualityStr(uint8_t q) {
-  switch (q) {
-    case 0: return "No fix";
-    case 1: return "GPS";
-    case 2: return "DGPS";
-    case 4: return "RTK Fixed";
-    case 5: return "RTK Float";
-    default: return "Unknown";
   }
 }
 
@@ -275,8 +370,8 @@ int normalizeHeading(int diff) {
   return diff;
 }
 
-// Handle incoming RTCM chunk and reassemble
-// Returns true if a complete message was assembled and sent to GPS
+// Handle incoming RTCM chunk and reassemble.
+// When complete, copies into rtcmWriteBuf for deferred write in loop().
 bool handleRTCMChunk(const uint8_t* data, int len) {
   if (len < 3) return false;
 
@@ -318,11 +413,14 @@ bool handleRTCMChunk(const uint8_t* data, int len) {
   rtcmBufferLen += payloadLen;
   expectedChunk++;
 
-  // Check if complete
+  // Check if complete — defer UART write to loop() to avoid blocking callback
   if (expectedChunk >= totalChunks) {
-    // Send complete RTCM message to GPS module
-    GPSSerial.write(rtcmBuffer, rtcmBufferLen);
-    Serial.printf("RTCM: sent %zu bytes to GPS\n", rtcmBufferLen);
+    if (rtcmWriteLen == 0 && rtcmBufferLen <= RTCM_WRITE_BUF_SIZE) {
+      memcpy(rtcmWriteBuf, rtcmBuffer, rtcmBufferLen);
+      rtcmWriteLen = rtcmBufferLen;
+    } else {
+      Serial.println("RTCM: write buffer busy, dropping");
+    }
 
     rtcmBufferLen = 0;
     expectedChunk = 0;
@@ -548,20 +646,24 @@ void setup() {
   Serial.begin(115200);
   Serial.println("ESP32 ESP-NOW Receiver Starting...");
 
-  // Initialize GPS serial connection for RTCM corrections
-  // MUST set RX buffer before begin() — default 256 bytes overflows at 460800 baud
-  GPSSerial.setRxBufferSize(2048);
-  GPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.println("GPS Serial initialized (UART2, 2048-byte RX buffer)");
-
   // Set the motor pins as outputs
   pinMode(MOTOR_PIN_5, OUTPUT);
   pinMode(MOTOR_PIN_18, OUTPUT);
   pinMode(MOTOR_PIN_19, OUTPUT);
   pinMode(MOTOR_PIN_23, OUTPUT);
 
-  // Set Wi-Fi mode to station (STA) mode
+  // Auto-detect GPS baud rate
+  Serial.println("Detecting GPS module baud rate...");
+  gpsActiveBaud = detectGPSBaud();
+  if (gpsActiveBaud > 0) {
+    Serial.printf("GPS module responding at %ld baud\n", gpsActiveBaud);
+  } else {
+    Serial.println("GPS module not detected — check wiring and power");
+  }
+
+  // Set Wi-Fi mode to station (STA) mode and pin channel to match hub
   WiFi.mode(WIFI_STA);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
 
   // Initialize ESP-NOW
   if (esp_now_init() != ESP_OK) {
@@ -575,6 +677,14 @@ void setup() {
 }
 
 void loop() {
+  // Write deferred RTCM data to GPS module (from ESP-NOW callback)
+  if (rtcmWriteLen > 0) {
+    size_t toWrite = rtcmWriteLen;
+    size_t written = GPSSerial.write(rtcmWriteBuf, toWrite);
+    rtcmWriteLen = 0;  // Clear even on partial write to avoid re-sending stale data
+    Serial.printf("RTCM: sent %zu/%zu bytes to GPS\n", written, toWrite);
+  }
+
   // Read NMEA sentences from RTK GPS module
   readGPS();
 
@@ -589,7 +699,8 @@ void loop() {
                     cur_LAT, cur_LON, cur_IMU, fixQualityStr(gps_fix_quality),
                     gps_fix_quality, age);
     } else {
-      Serial.println("GPS: Waiting for fix...");
+      Serial.printf("GPS: Waiting for fix... | UART RX: %lu bytes, %lu '$', %lu sentences | Baud: %ld\n",
+                    gpsRxByteCount, gpsDollarCount, gpsNmeaParsed, gpsActiveBaud);
     }
   }
 
