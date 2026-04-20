@@ -23,9 +23,9 @@ static const uint32_t SEQ_WINDOW = 100;  // Accept packets within this window ah
 #define RTCM_ESPNOW_PREFIX 0xD3  // Standard RTCM3 preamble byte
 
 // RTK GPS serial connection (UART2)
-// Wiring: GPS module TX → ESP32 GPIO16 (RX), GPS module RX → ESP32 GPIO17 (TX)
-#define GPS_RX_PIN 16
-#define GPS_TX_PIN 17
+// Wiring: Click board TX → ESP32 GPIO21, Click board RX → ESP32 GPIO22
+#define GPS_RX_PIN 21
+#define GPS_TX_PIN 22
 HardwareSerial GPSSerial(2);
 
 // Baud rates to try during auto-detection (most likely first)
