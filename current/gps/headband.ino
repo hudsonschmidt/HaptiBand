@@ -26,10 +26,12 @@ static const uint32_t SEQ_WINDOW = 100;  // Accept packets within this window ah
 // Wiring: Click board TX → ESP32 GPIO21, Click board RX → ESP32 GPIO22
 #define GPS_RX_PIN 21
 #define GPS_TX_PIN 22
+// RST pin — connect Click board RST to this GPIO (NOT to 3.3V anymore)
+#define GPS_RST_PIN 4
 HardwareSerial GPSSerial(2);
 
 // Baud rates to try during auto-detection (most likely first)
-static const long GPS_BAUDS[] = {460800, 115200, 38400, 9600};
+static const long GPS_BAUDS[] = {460800, 115200, 230400, 921600, 38400, 9600};
 static const int  GPS_BAUD_COUNT = sizeof(GPS_BAUDS) / sizeof(GPS_BAUDS[0]);
 static long       gpsActiveBaud = 0;  // The baud rate that worked
 
@@ -652,6 +654,14 @@ void setup() {
   pinMode(MOTOR_PIN_19, OUTPUT);
   pinMode(MOTOR_PIN_23, OUTPUT);
 
+  // Hardware reset the GPS module via RST pin
+  pinMode(GPS_RST_PIN, OUTPUT);
+  Serial.println("Resetting GPS module...");
+  digitalWrite(GPS_RST_PIN, LOW);   // Assert reset
+  delay(200);                        // Hold for 200ms
+  digitalWrite(GPS_RST_PIN, HIGH);  // Release reset
+  delay(3000);                       // Wait 3s for module to boot and start NMEA output
+
   // Auto-detect GPS baud rate
   Serial.println("Detecting GPS module baud rate...");
   gpsActiveBaud = detectGPSBaud();
@@ -659,6 +669,27 @@ void setup() {
     Serial.printf("GPS module responding at %ld baud\n", gpsActiveBaud);
   } else {
     Serial.println("GPS module not detected — check wiring and power");
+    // Try with TX/RX swapped as fallback
+    Serial.println("Retrying with TX/RX swapped...");
+    #undef GPS_RX_PIN
+    #undef GPS_TX_PIN
+    #define GPS_RX_PIN 22
+    #define GPS_TX_PIN 21
+    gpsActiveBaud = detectGPSBaud();
+    if (gpsActiveBaud > 0) {
+      Serial.printf("GPS detected with SWAPPED pins at %ld baud\n", gpsActiveBaud);
+      Serial.println("NOTE: Swap your TX/RX wires for correct operation");
+    } else {
+      Serial.println("Still no GPS data. Check: CS pin connected? VCC SEL jumper at 3.3V?");
+      // Restore original pins
+      #undef GPS_RX_PIN
+      #undef GPS_TX_PIN
+      #define GPS_RX_PIN 21
+      #define GPS_TX_PIN 22
+      GPSSerial.end();
+      GPSSerial.setRxBufferSize(2048);
+      GPSSerial.begin(460800, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    }
   }
 
   // Set Wi-Fi mode to station (STA) mode and pin channel to match hub
