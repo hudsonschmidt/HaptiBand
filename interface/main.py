@@ -36,9 +36,9 @@ GRID_COLS = 5
 # NTRIP / RTK Configuration
 NTRIP_CASTER = "rtgpsout.earthscope.org"
 NTRIP_PORT = 2101
-NTRIP_MOUNTPOINT = "P528_RTCM3P3"
-NTRIP_USER = "compassionate_euler"
-NTRIP_PASS = "hBv0TuTG0q9CqcZJ"
+NTRIP_MOUNTPOINT = "USLO_RTCM3P3"
+NTRIP_USER = "suspicious_panini"
+NTRIP_PASS = "QOpijUWXifA5oH93"
 
 
 # ----------------------- GPS Functions -----------------------
