@@ -26,8 +26,10 @@ static const uint32_t SEQ_WINDOW = 100;  // Accept packets within this window ah
 // Wiring: Click board TX → ESP32 GPIO21, Click board RX → ESP32 GPIO22
 #define GPS_RX_PIN 21
 #define GPS_TX_PIN 22
-// RST pin — connect Click board RST to this GPIO (NOT to 3.3V anymore)
-#define GPS_RST_PIN 4
+// Control pins — directly drive these from ESP32 GPIOs
+#define GPS_RST_PIN 4    // Click board RST → ESP32 D4
+#define GPS_CEN_PIN 2    // Click board CS  → ESP32 D2 (chip enable / LDO power)
+#define GPS_WUP_PIN 15   // Click board PWM → ESP32 D15 (wakeup pulse)
 HardwareSerial GPSSerial(2);
 
 // Baud rates to try during auto-detection (most likely first)
@@ -654,13 +656,39 @@ void setup() {
   pinMode(MOTOR_PIN_19, OUTPUT);
   pinMode(MOTOR_PIN_23, OUTPUT);
 
-  // Hardware reset the GPS module via RST pin
+  // Initialize GPS control pins (matches MikroE driver gnssrtk3da_enable_device sequence)
   pinMode(GPS_RST_PIN, OUTPUT);
-  Serial.println("Resetting GPS module...");
-  digitalWrite(GPS_RST_PIN, LOW);   // Assert reset
-  delay(200);                        // Hold for 200ms
-  digitalWrite(GPS_RST_PIN, HIGH);  // Release reset
-  delay(3000);                       // Wait 3s for module to boot and start NMEA output
+  pinMode(GPS_CEN_PIN, OUTPUT);
+  pinMode(GPS_WUP_PIN, OUTPUT);
+
+  // Step 1: Enable module power via CEN (CS) pin
+  // Try both polarities — some board revisions invert CS
+  Serial.println("Enabling GPS module (CEN HIGH)...");
+  digitalWrite(GPS_CEN_PIN, HIGH);
+  delay(1000);
+
+  // Also try LOW in case board logic inverts
+  Serial.println("Also trying CEN LOW...");
+  digitalWrite(GPS_CEN_PIN, LOW);
+  delay(1000);
+
+  // Back to HIGH (MikroE driver default)
+  digitalWrite(GPS_CEN_PIN, HIGH);
+  delay(1000);
+
+  // Step 2: Wake up module with WUP pulse (HIGH 100ms then LOW)
+  Serial.println("Sending WUP pulse...");
+  digitalWrite(GPS_WUP_PIN, HIGH);
+  delay(100);
+  digitalWrite(GPS_WUP_PIN, LOW);
+  delay(1000);  // Wait 1 second
+
+  // Step 3: Hardware reset
+  Serial.println("Resetting GPS module (RST pulse)...");
+  digitalWrite(GPS_RST_PIN, LOW);
+  delay(100);
+  digitalWrite(GPS_RST_PIN, HIGH);
+  delay(2000);  // Wait 2 seconds for module to boot
 
   // Auto-detect GPS baud rate
   Serial.println("Detecting GPS module baud rate...");
