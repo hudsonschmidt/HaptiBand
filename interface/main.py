@@ -915,14 +915,26 @@ class HaptiBandApp:
             imu = data[imu_start:]
 
             lat_str, lon_str = gps.split(",")
-            self.hub_lat = float(lat_str)
-            self.hub_lon = float(lon_str)
-            self.hub_heading = int(imu)
+            lat_val = float(lat_str)
+            lon_val = float(lon_str)
+            heading_val = int(float(imu))
+
+            # Skip if hub has no fix (sends 0,0)
+            if lat_val == 0.0 and lon_val == 0.0:
+                self.gps_status_label.config(text="Hub waiting for GPS fix...", foreground="orange")
+                self.hub_lat_label.config(text="Lat: --")
+                self.hub_lon_label.config(text="Lon: --")
+                self.hub_heading_label.config(text="Heading: --")
+                return
+
+            self.hub_lat = lat_val
+            self.hub_lon = lon_val
+            self.hub_heading = heading_val
 
             # Update UI
             self.gps_status_label.config(text="Receiving data", foreground="green")
-            self.hub_lat_label.config(text=f"Lat: {self.hub_lat:.6f}")
-            self.hub_lon_label.config(text=f"Lon: {self.hub_lon:.6f}")
+            self.hub_lat_label.config(text=f"Lat: {self.hub_lat:.8f}")
+            self.hub_lon_label.config(text=f"Lon: {self.hub_lon:.8f}")
             self.hub_heading_label.config(text=f"Heading: {self.hub_heading}\u00b0")
 
             # Calculate column positions
@@ -930,7 +942,7 @@ class HaptiBandApp:
             positions = calculate_column_positions(self.hub_lat, self.hub_lon, self.hub_heading, spacing)
 
             for i, ((lat, lon), heading) in enumerate(positions):
-                self.column_labels[i].config(text=f"{lat:.6f}, {lon:.6f}")
+                self.column_labels[i].config(text=f"{lat:.8f}, {lon:.8f}")
 
             # Flash grid cells yellow briefly
             for (row, col), (cell, _, _) in self.gps_grid_cells.items():
@@ -939,7 +951,7 @@ class HaptiBandApp:
 
             self.root.after(300, self.update_all_grids)
 
-            self.log(f"Hub GPS: {self.hub_lat:.6f}, {self.hub_lon:.6f} @ {self.hub_heading}\u00b0")
+            self.log(f"Hub GPS: {self.hub_lat:.8f}, {self.hub_lon:.8f} @ {self.hub_heading}\u00b0")
 
             # Auto-relay if enabled
             if self.auto_relay.get():

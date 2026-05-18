@@ -246,7 +246,7 @@ void parseNMEA(const char* sentence) {
       cur_LON = nmeaToDecimal(lon_raw.c_str(), lon_raw.length(), lon_dir);
       gps_valid = true;
       lastGpsTime = millis();
-      Serial.printf("GGA: %.6f, %.6f | Fix: %s (%d)\n", cur_LAT, cur_LON, fixQualityStr(q), q);
+      Serial.printf("GGA: %.8f, %.8f | Fix: %s (%d)\n", cur_LAT, cur_LON, fixQualityStr(q), q);
     }
 
   } else if (strncmp(type, "RMC,", 4) == 0) {
@@ -273,7 +273,7 @@ void parseNMEA(const char* sentence) {
         cur_IMU = (int)course.toFloat();
       }
 
-      Serial.printf("RMC: %.6f, %.6f | Heading: %d°\n",
+      Serial.printf("RMC: %.8f, %.8f | Heading: %d°\n",
                     cur_LAT, cur_LON, cur_IMU);
     }
   }
@@ -572,60 +572,62 @@ void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len)
     double recv_lon = strtod(gps.substring(comma + 1).c_str(), NULL);
     int recv_imu = imu.toInt();
 
-    Serial.printf("Target GPS=%.6f,%.6f  IMU=%d\n", recv_lat, recv_lon, recv_imu);
-    Serial.printf("Current GPS=%.6f,%.6f  IMU=%d | Fix: %s\n",
+    Serial.printf("Target GPS=%.8f,%.8f  IMU=%d\n", recv_lat, recv_lon, recv_imu);
+    Serial.printf("Current GPS=%.8f,%.8f  IMU=%d | Fix: %s\n",
                   cur_LAT, cur_LON, cur_IMU, fixQualityStr(gps_fix_quality));
 
     if (!gps_valid) {
-      Serial.println("WARNING: No GPS fix yet, cannot compare position");
+      // No own fix yet — pulse front motor to confirm message receipt
+      Serial.println("No GPS fix - receipt confirmation pulse");
+      buzzPulse(MOTOR_PIN_18, 150);
       return;
     }
 
     // Compare GPS position
-    bool lat_match = fabs(recv_lat - cur_LAT) < GPS_TOLERANCE;
-    bool lon_match = fabs(recv_lon - cur_LON) < GPS_TOLERANCE;
-    bool gps_match = lat_match && lon_match;
+    bool gps_match = fabs(recv_lat - cur_LAT) < GPS_TOLERANCE &&
+                     fabs(recv_lon - cur_LON) < GPS_TOLERANCE;
 
     // Calculate heading difference (positive = we're facing too far right)
     int heading_diff = normalizeHeading(cur_IMU - recv_imu);
     int abs_heading_diff = abs(heading_diff);
+    bool heading_match = abs_heading_diff <= IMU_DEADZONE;
 
     Serial.printf("GPS match: %s, Heading diff: %d°\n",
                   gps_match ? "YES" : "NO", heading_diff);
 
-    // Handle IMU correction with tiered tolerance
-    if (abs_heading_diff <= IMU_DEADZONE) {
-      // On target heading - check if GPS also matches for confirmation
-      if (gps_match) {
-        Serial.println("ON TARGET - confirmation buzz");
-        // Quick confirmation: all motors single pulse
-        buzz(MOTOR_PIN_5,  HIGH);
-        buzz(MOTOR_PIN_18, HIGH);
-        buzz(MOTOR_PIN_19, HIGH);
-        buzz(MOTOR_PIN_23, HIGH);
-        delay(150);
-        buzz(MOTOR_PIN_5,  LOW);
-        buzz(MOTOR_PIN_18, LOW);
-        buzz(MOTOR_PIN_19, LOW);
-        buzz(MOTOR_PIN_23, LOW);
-      }
-      // else: heading OK but position off - GPS correction would go here
-    } else if (abs_heading_diff <= IMU_SOFT_LIMIT) {
-      // Soft correction needed
-      Serial.printf("SOFT correction: turn %s\n", heading_diff > 0 ? "LEFT" : "RIGHT");
-      if (heading_diff > 0) {
-        buzzRotateLeft(false);   // facing too far right, turn left
+    if (gps_match && heading_match) {
+      // Fully on target — confirmation buzz (all motors)
+      Serial.println("ON TARGET - confirmation buzz");
+      buzz(MOTOR_PIN_5,  HIGH);
+      buzz(MOTOR_PIN_18, HIGH);
+      buzz(MOTOR_PIN_19, HIGH);
+      buzz(MOTOR_PIN_23, HIGH);
+      delay(150);
+      buzz(MOTOR_PIN_5,  LOW);
+      buzz(MOTOR_PIN_18, LOW);
+      buzz(MOTOR_PIN_19, LOW);
+      buzz(MOTOR_PIN_23, LOW);
+    } else if (!heading_match) {
+      // Heading correction takes priority over position
+      if (abs_heading_diff <= IMU_SOFT_LIMIT) {
+        Serial.printf("SOFT correction: turn %s\n", heading_diff > 0 ? "LEFT" : "RIGHT");
+        if (heading_diff > 0) {
+          buzzRotateLeft(false);
+        } else {
+          buzzRotateRight(false);
+        }
       } else {
-        buzzRotateRight(false);  // facing too far left, turn right
+        Serial.printf("HARD correction: turn %s\n", heading_diff > 0 ? "LEFT" : "RIGHT");
+        if (heading_diff > 0) {
+          buzzRotateLeft(true);
+        } else {
+          buzzRotateRight(true);
+        }
       }
     } else {
-      // Hard correction needed
-      Serial.printf("HARD correction: turn %s\n", heading_diff > 0 ? "LEFT" : "RIGHT");
-      if (heading_diff > 0) {
-        buzzRotateLeft(true);    // facing too far right, turn left
-      } else {
-        buzzRotateRight(true);   // facing too far left, turn right
-      }
+      // Heading OK but GPS position is off — buzz back motor
+      Serial.println("GPS position off - move needed");
+      buzzPulse(MOTOR_PIN_23, 200);
     }
     return;                             // done
   }
@@ -754,7 +756,7 @@ void loop() {
 
     if (gps_valid) {
       unsigned long age = (now - lastGpsTime) / 1000;
-      Serial.printf("GPS: %.6f, %.6f | Heading: %d° | Fix: %s (%d) | Age: %lus\n",
+      Serial.printf("GPS: %.8f, %.8f | Heading: %d° | Fix: %s (%d) | Age: %lus\n",
                     cur_LAT, cur_LON, cur_IMU, fixQualityStr(gps_fix_quality),
                     gps_fix_quality, age);
     } else {
