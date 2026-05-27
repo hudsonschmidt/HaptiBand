@@ -5,6 +5,13 @@ import threading
 import time
 import math
 import select
+import base64
+import sys
+import os
+
+# Add parent directory to path so we can import rtk module
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "current", "gps"))
+from rtk import NTRIPClient
 
 # 5 - Left Temple
 # 18 - Forehead
@@ -25,6 +32,13 @@ PIN_BACK = 23
 # Grid dimensions
 GRID_ROWS = 5
 GRID_COLS = 5
+
+# NTRIP / RTK Configuration
+NTRIP_CASTER = "rtgpsout.earthscope.org"
+NTRIP_PORT = 2101
+NTRIP_MOUNTPOINT = "USLO_RTCM3P3"
+NTRIP_USER = "suspicious_panini"
+NTRIP_PASS = "QOpijUWXifA5oH93"
 
 
 # ----------------------- GPS Functions -----------------------
@@ -117,6 +131,13 @@ class HaptiBandApp:
         self.shutdown_event = threading.Event()
         self.auto_relay = tk.BooleanVar(value=False)
         self.spacing_var = tk.DoubleVar(value=3.0)
+
+        # NTRIP / RTK state
+        self.ntrip_enabled = tk.BooleanVar(value=True)
+        self.ntrip_client = None
+        self.ntrip_thread = None
+        self.rtcm_lock = threading.Lock()
+        self.rtcm_stats = {"bytes_sent": 0, "packets_sent": 0}
 
         # Grid cell references (shared between tabs)
         self.grid_cells = {}
@@ -568,6 +589,19 @@ class HaptiBandApp:
         self.hub_heading_label = ttk.Label(gps_display_frame, text="Heading: --")
         self.hub_heading_label.pack(anchor="w")
 
+        # NTRIP / RTK Settings
+        ntrip_frame = ttk.LabelFrame(middle_panel, text="RTK Corrections (NTRIP)", padding=10)
+        ntrip_frame.pack(fill="x", pady=(0, 10))
+
+        ntrip_check = ttk.Checkbutton(ntrip_frame, text="Enable NTRIP relay", variable=self.ntrip_enabled)
+        ntrip_check.pack(anchor="w")
+
+        self.ntrip_status_label = ttk.Label(ntrip_frame, text="NTRIP: Inactive", foreground="gray")
+        self.ntrip_status_label.pack(anchor="w", pady=(5, 0))
+
+        self.ntrip_stats_label = ttk.Label(ntrip_frame, text="RTCM: 0 pkts, 0 bytes", font=("TkDefaultFont", 8))
+        self.ntrip_stats_label.pack(anchor="w")
+
         # GPS Listener status
         self.listener_status = ttk.Label(middle_panel, text="GPS Listener: Inactive", foreground="gray")
         self.listener_status.pack(anchor="w")
@@ -665,6 +699,9 @@ class HaptiBandApp:
                 # Start GPS listener
                 self.start_gps_listener()
 
+                # Start NTRIP relay
+                self.start_ntrip_relay()
+
             except Exception as e:
                 self.root.after(0, lambda: self.on_connection_failed(str(e)))
 
@@ -686,6 +723,7 @@ class HaptiBandApp:
 
     def disconnect_from_hub(self):
         """Disconnect from hub."""
+        self.stop_ntrip_relay()
         self.stop_gps_listener()
 
         with self.sock_lock:
@@ -712,6 +750,13 @@ class HaptiBandApp:
             duration = int(time.time() - self.connect_time)
             mins, secs = divmod(duration, 60)
             self.status_label.config(text=f"Connected ({mins}m {secs}s)")
+
+        # Update NTRIP stats
+        if hasattr(self, 'ntrip_stats_label'):
+            with self.rtcm_lock:
+                stats = self.rtcm_stats.copy()
+            self.ntrip_stats_label.config(
+                text=f"RTCM: {stats['packets_sent']} pkts, {stats['bytes_sent']} bytes")
 
         self.root.after(1000, self.update_status)
 
@@ -767,6 +812,97 @@ class HaptiBandApp:
             self.gps_listener_thread.join(timeout=1.0)
         self.gps_listener_running = False
 
+    # ----------------------- NTRIP / RTK Relay -----------------------
+    def start_ntrip_relay(self):
+        """Start background NTRIP client that relays RTCM corrections to hub."""
+        if not self.ntrip_enabled.get():
+            return
+        if self.ntrip_thread and self.ntrip_thread.is_alive():
+            return
+
+        self.ntrip_client = NTRIPClient(
+            caster=NTRIP_CASTER,
+            port=NTRIP_PORT,
+            mountpoint=NTRIP_MOUNTPOINT,
+            username=NTRIP_USER,
+            password=NTRIP_PASS,
+        )
+
+        self.ntrip_thread = threading.Thread(target=self._ntrip_relay_loop, daemon=True)
+        self.ntrip_thread.start()
+        self.root.after(0, lambda: self.log("NTRIP relay started"))
+        self.root.after(0, lambda: self.ntrip_status_label.config(
+            text="NTRIP: Connecting...", foreground="orange"))
+
+    def stop_ntrip_relay(self):
+        """Stop the NTRIP relay thread."""
+        if self.ntrip_client:
+            self.ntrip_client.stop_stream()
+            self.ntrip_client.disconnect()
+            self.ntrip_client = None
+        if self.ntrip_thread:
+            self.ntrip_thread.join(timeout=2.0)
+            self.ntrip_thread = None
+        self.root.after(0, lambda: self.ntrip_status_label.config(
+            text="NTRIP: Inactive", foreground="gray"))
+
+    def _ntrip_relay_loop(self):
+        """Background loop: connect to NTRIP caster and relay RTCM to hub."""
+        client = self.ntrip_client
+        if not client:
+            return
+
+        # Retry connection with backoff
+        retry_delay = 5
+        while not self.shutdown_event.is_set():
+            if client.connect():
+                break
+            self.root.after(0, lambda d=retry_delay: self.log(
+                f"NTRIP connect failed, retrying in {d}s..."))
+            for _ in range(retry_delay):
+                if self.shutdown_event.is_set():
+                    return
+                time.sleep(1)
+            retry_delay = min(retry_delay * 2, 60)
+
+        if self.shutdown_event.is_set():
+            return
+
+        self.root.after(0, lambda: self.log("NTRIP connected, relaying RTCM corrections"))
+        self.root.after(0, lambda: self.ntrip_status_label.config(
+            text="NTRIP: Active", foreground="green"))
+
+        while not self.shutdown_event.is_set():
+            if not client.connected:
+                self.root.after(0, lambda: self.ntrip_status_label.config(
+                    text="NTRIP: Reconnecting...", foreground="orange"))
+                if not client.connect():
+                    time.sleep(5)
+                    continue
+                self.root.after(0, lambda: self.ntrip_status_label.config(
+                    text="NTRIP: Active", foreground="green"))
+
+            data = client.read_data(timeout=1.0)
+            if data:
+                self._send_rtcm(data)
+
+        client.disconnect()
+        self.root.after(0, lambda: self.log("NTRIP relay stopped"))
+
+    def _send_rtcm(self, data: bytes):
+        """Send RTCM correction data to hub as base64-encoded message."""
+        try:
+            encoded = base64.b64encode(data).decode("ascii")
+            msg = f"RTCM:{encoded}\n".encode()
+            with self.sock_lock:
+                if self.sock:
+                    self.sock.sendall(msg)
+            with self.rtcm_lock:
+                self.rtcm_stats["bytes_sent"] += len(data)
+                self.rtcm_stats["packets_sent"] += 1
+        except Exception as e:
+            self.root.after(0, lambda err=e: self.log(f"RTCM send error: {err}"))
+
     def process_gps_data(self, data):
         """Process received GPS/IMU data from hub."""
         try:
@@ -779,14 +915,26 @@ class HaptiBandApp:
             imu = data[imu_start:]
 
             lat_str, lon_str = gps.split(",")
-            self.hub_lat = float(lat_str)
-            self.hub_lon = float(lon_str)
-            self.hub_heading = int(imu)
+            lat_val = float(lat_str)
+            lon_val = float(lon_str)
+            heading_val = int(float(imu))
+
+            # Skip if hub has no fix (sends 0,0)
+            if lat_val == 0.0 and lon_val == 0.0:
+                self.gps_status_label.config(text="Hub waiting for GPS fix...", foreground="orange")
+                self.hub_lat_label.config(text="Lat: --")
+                self.hub_lon_label.config(text="Lon: --")
+                self.hub_heading_label.config(text="Heading: --")
+                return
+
+            self.hub_lat = lat_val
+            self.hub_lon = lon_val
+            self.hub_heading = heading_val
 
             # Update UI
             self.gps_status_label.config(text="Receiving data", foreground="green")
-            self.hub_lat_label.config(text=f"Lat: {self.hub_lat:.6f}")
-            self.hub_lon_label.config(text=f"Lon: {self.hub_lon:.6f}")
+            self.hub_lat_label.config(text=f"Lat: {self.hub_lat:.8f}")
+            self.hub_lon_label.config(text=f"Lon: {self.hub_lon:.8f}")
             self.hub_heading_label.config(text=f"Heading: {self.hub_heading}\u00b0")
 
             # Calculate column positions
@@ -794,7 +942,7 @@ class HaptiBandApp:
             positions = calculate_column_positions(self.hub_lat, self.hub_lon, self.hub_heading, spacing)
 
             for i, ((lat, lon), heading) in enumerate(positions):
-                self.column_labels[i].config(text=f"{lat:.6f}, {lon:.6f}")
+                self.column_labels[i].config(text=f"{lat:.8f}, {lon:.8f}")
 
             # Flash grid cells yellow briefly
             for (row, col), (cell, _, _) in self.gps_grid_cells.items():
@@ -803,7 +951,7 @@ class HaptiBandApp:
 
             self.root.after(300, self.update_all_grids)
 
-            self.log(f"Hub GPS: {self.hub_lat:.6f}, {self.hub_lon:.6f} @ {self.hub_heading}\u00b0")
+            self.log(f"Hub GPS: {self.hub_lat:.8f}, {self.hub_lon:.8f} @ {self.hub_heading}\u00b0")
 
             # Auto-relay if enabled
             if self.auto_relay.get():
