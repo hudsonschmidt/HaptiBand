@@ -40,6 +40,7 @@ class NTRIPClient:
         # Stats
         self.bytes_received = 0
         self.last_data_time: Optional[float] = None
+        self.last_error: Optional[str] = None
 
     def _build_auth_header(self) -> str:
         """Build HTTP Basic Authorization header."""
@@ -130,19 +131,20 @@ class NTRIPClient:
 
             # Check for success (ICY 200 OK or HTTP/1.x 200)
             if "200" not in header.split("\r\n")[0]:
-                print(f"Connection failed: {header.split(chr(13))[0]}")
+                self.last_error = f"Server: {header.split(chr(13))[0].strip()}"
                 self.sock.close()
                 return False
 
-            print(f"Connected to {self.caster}:{self.port}/{self.mountpoint}")
             self.connected = True
-            self.sock.settimeout(30.0)  # Longer timeout for data stream
+            self.sock.settimeout(30.0)
             return True
 
         except Exception as e:
-            print(f"Connection error: {e}")
+            self.last_error = str(e)
             if self.sock:
-                self.sock.close()
+                try: self.sock.close()
+                except Exception: pass
+                self.sock = None
             return False
 
     def disconnect(self):
@@ -176,7 +178,7 @@ class NTRIPClient:
         except socket.timeout:
             return None
         except Exception as e:
-            print(f"Read error: {e}")
+            self.last_error = str(e)
             self.connected = False
             return None
 
@@ -203,7 +205,6 @@ class NTRIPClient:
         while self.running:
             if not self.connected:
                 if not self.connect():
-                    print("Reconnecting in 5 seconds...")
                     time.sleep(5)
                     continue
 
