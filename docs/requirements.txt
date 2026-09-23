@@ -1,2 +1,6 @@
-bleak
-PyQt5
+# The dashboard (interface/main.py) and CLI tools (current/gps/) use only the
+# Python standard library: tkinter, socket, threading, base64, select.
+# No third-party packages are required.
+#
+# Note: tkinter ships with python.org installers; on Homebrew Python install it
+# separately with: brew install python-tk

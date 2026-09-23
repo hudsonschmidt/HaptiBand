@@ -216,16 +216,17 @@ def split_coordinates(gps: str, imu: str, spacing_feet: float = 3.0):
     offset_multipliers = [-2.0, -1.0, 0.0, 1.0, 2.0]
     result = []
 
+    # Offset perpendicular to the heading: compass angle heading+90° points
+    # to the hub's right, so north component = cos(perp), east = sin(perp)
+    perp_angle = theta + math.pi / 2
+
     for mult in offset_multipliers:
         distance_feet = mult * spacing_feet
         lat_offset, lon_offset = feet_to_degrees(abs(distance_feet), lat)
+        sign = 1 if distance_feet >= 0 else -1
 
-        if distance_feet >= 0:
-            new_lat = lat - (lat_offset * math.cos(theta))
-            new_lon = lon + (lon_offset * math.sin(theta))
-        else:
-            new_lat = lat + (lat_offset * math.cos(theta))
-            new_lon = lon - (lon_offset * math.sin(theta))
+        new_lat = lat + (lat_offset * math.cos(perp_angle) * sign)
+        new_lon = lon + (lon_offset * math.sin(perp_angle) * sign)
 
         result.append(((new_lat, new_lon), theta_deg))
 

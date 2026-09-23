@@ -208,7 +208,7 @@ double nmeaToDecimal(const char* raw, int rawLen, const String& dir) {
   for (int i = 0; i < rawLen; i++) { if (raw[i] == '.') { dotPos = i; break; } }
   if (dotPos < 0) return 0.0;
   int degLen = dotPos - 2;
-  if (degLen < 1) return 0.0;
+  if (degLen < 1 || degLen > 7) return 0.0;  // corrupt sentence, degBuf is 8 bytes
 
   char tmp[24];
   int cpLen = (rawLen < 23) ? rawLen : 23;

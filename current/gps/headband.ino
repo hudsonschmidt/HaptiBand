@@ -49,6 +49,12 @@ static unsigned long lastRtcmTime = 0;
 static uint8_t  rtcmWriteBuf[RTCM_WRITE_BUF_SIZE];
 static volatile size_t rtcmWriteLen = 0;
 
+// Deferred command buffer — ESP-NOW recv callback runs in the WiFi task,
+// so blocking buzz sequences (delay-based) must execute from loop() instead
+#define CMD_BUF_SIZE 250
+static char pendingCmd[CMD_BUF_SIZE + 1];
+static volatile bool cmdPending = false;
+
 // RTCM diagnostic counters
 static unsigned long rtcmBytesReceived = 0;
 static unsigned long rtcmBytesToGPS = 0;
@@ -101,13 +107,13 @@ const int IMU_DEADZONE = 5;
 const int IMU_SOFT_LIMIT = 15;
 
 // ─────────────── Baud rate auto-detection ────────────────────
-long detectGPSBaud() {
+long detectGPSBaud(int rxPin, int txPin) {
   for (int i = 0; i < GPS_BAUD_COUNT; i++) {
     long baud = GPS_BAUDS[i];
-    Serial.printf("Probing GPS at %ld baud...\n", baud);
+    Serial.printf("Probing GPS at %ld baud (RX=%d TX=%d)...\n", baud, rxPin, txPin);
     GPSSerial.end();
     GPSSerial.setRxBufferSize(2048);
-    GPSSerial.begin(baud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+    GPSSerial.begin(baud, SERIAL_8N1, rxPin, txPin);
     while (GPSSerial.available()) GPSSerial.read();
 
     unsigned long start = millis();
@@ -124,13 +130,11 @@ long detectGPSBaud() {
     if (sawDollar || (totalBytes > 10 && asciiCount > totalBytes / 2)) {
       Serial.printf("GPS detected at %ld baud\n", baud);
       GPSSerial.end(); GPSSerial.setRxBufferSize(2048);
-      GPSSerial.begin(baud, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+      GPSSerial.begin(baud, SERIAL_8N1, rxPin, txPin);
       return baud;
     }
   }
   Serial.println("WARNING: No GPS module detected!");
-  GPSSerial.end(); GPSSerial.setRxBufferSize(2048);
-  GPSSerial.begin(460800, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   return 0;
 }
 
@@ -153,7 +157,7 @@ double nmeaToDecimal(const char* raw, int rawLen, const String& dir) {
   for (int i = 0; i < rawLen; i++) { if (raw[i] == '.') { dotPos = i; break; } }
   if (dotPos < 0) return 0.0;
   int degLen = dotPos - 2;
-  if (degLen < 1) return 0.0;
+  if (degLen < 1 || degLen > 7) return 0.0;  // corrupt sentence, degBuf is 8 bytes
   char tmp[24]; int cpLen = (rawLen < 23) ? rawLen : 23;
   memcpy(tmp, raw, cpLen); tmp[cpLen] = '\0';
   char degBuf[8]; memcpy(degBuf, tmp, degLen); degBuf[degLen] = '\0';
@@ -317,14 +321,23 @@ String verifyAndExtract(const String& authMsg) {
 }
 
 // ─────────────── ESP-NOW receive callback ────────────────────
+// Keep this minimal: RTCM chunks get reassembled (memcpy only), everything
+// else is parked in pendingCmd for loop() to verify and act on
 void OnDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
   if (len <= 0) return;
 
   if (data[0] == RTCM_ESPNOW_PREFIX) { handleRTCMChunk(data, len); return; }
 
-  char buf[len + 1];
-  memcpy(buf, data, len); buf[len] = '\0';
-  String authMsg(buf); authMsg.trim();
+  if (cmdPending) return;  // previous command not consumed yet
+  int cpLen = (len < CMD_BUF_SIZE) ? len : CMD_BUF_SIZE;
+  memcpy(pendingCmd, data, cpLen);
+  pendingCmd[cpLen] = '\0';
+  cmdPending = true;
+}
+
+// ─────────────── Command processing (runs in loop) ────────────────────
+void processCommand(const char* raw) {
+  String authMsg(raw); authMsg.trim();
 
   String msg = verifyAndExtract(authMsg);
   if (msg.length() == 0) return;
@@ -400,20 +413,12 @@ void setup() {
   digitalWrite(GPS_RST_PIN, LOW);  delay(100);
   digitalWrite(GPS_RST_PIN, HIGH); delay(2000);
 
-  gpsActiveBaud = detectGPSBaud();
+  gpsActiveBaud = detectGPSBaud(GPS_RX_PIN, GPS_TX_PIN);
   if (gpsActiveBaud > 0) Serial.printf("GPS module responding at %ld baud\n", gpsActiveBaud);
   else {
     Serial.println("GPS module not detected, trying swapped pins...");
-    #undef GPS_RX_PIN
-    #undef GPS_TX_PIN
-    #define GPS_RX_PIN 22
-    #define GPS_TX_PIN 21
-    gpsActiveBaud = detectGPSBaud();
+    gpsActiveBaud = detectGPSBaud(GPS_TX_PIN, GPS_RX_PIN);
     if (gpsActiveBaud == 0) {
-      #undef GPS_RX_PIN
-      #undef GPS_TX_PIN
-      #define GPS_RX_PIN 21
-      #define GPS_TX_PIN 22
       GPSSerial.end(); GPSSerial.setRxBufferSize(2048);
       GPSSerial.begin(460800, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     }
@@ -437,6 +442,15 @@ void setup() {
 }
 
 void loop() {
+  // Process deferred command from ESP-NOW callback. Copy first and release
+  // the slot so a message arriving mid-buzz is parked instead of dropped.
+  if (cmdPending) {
+    char cmdCopy[CMD_BUF_SIZE + 1];
+    strcpy(cmdCopy, pendingCmd);
+    cmdPending = false;
+    processCommand(cmdCopy);
+  }
+
   // Write deferred RTCM data to GPS module
   if (rtcmWriteLen > 0) {
     size_t toWrite = rtcmWriteLen;
