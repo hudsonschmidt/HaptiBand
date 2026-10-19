@@ -6,10 +6,7 @@ import time
 import math
 import select
 import base64
-import sys
-import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "current", "gps"))
 from rtk import NTRIPClient
 
 # ----------------------- Constants -----------------------
